@@ -1,0 +1,433 @@
+Two fixes to MAME's i386 core, found while getting the SunOS 4.0.1 DOS window
+to run on the Sun386i. Measured against MAME 0.289.
+
+
+1. A task switch must reach the GDT and the TSSes as the supervisor
+---------------------------------------------------------------------------
+
+i386_task_switch() and i286_task_switch() read and write the descriptor tables
+and both task state segments through the READ/WRITE macros, and in i386.h those
+are
+
+    inline uint32_t READ32(uint32_t ea) { return READ32PL(ea, m_CPL); }
+
+so every one of those accesses is made at the privilege level the processor
+happens to be running at. On real hardware they are implicit accesses by the
+control unit and are always made as the supervisor, whatever the CPL is.
+
+It goes unnoticed until something starts a task switch from ring 3. SunOS 4.0.1
+on the Sun386i does exactly that, and it is how it runs DOS: the kernel maps the
+process its own task state segment at user address 0x110000, leaves the nested
+task flag set and the back link pointing at it, and the DOS emulator then enters
+virtual 8086 mode with a plain
+
+    mov eax, esp
+    iretd
+    mov esp, eax
+
+An IRET with NT set is a task return, so that single instruction switches tasks
+with no system call in the way, which is what made it fast in 1988. Under MAME
+the switch began and never finished. The first thing it touches is the busy bit
+in the outgoing task's descriptor, at gdt+0x5d, which lives on a kernel only
+page: at CPL 3 the translation fails, a page fault is thrown, and because MAME
+raises faults with a C++ throw the exception leaves i386_task_switch() from the
+middle with nothing logged. The process died with SIGSEGV on the iretd.
+
+Measured: probe iret pc=00120504 cpl=3 nt=1 tr=0058 link=00000088, then
+probe fault 14 err=00000005 cr2=fc0b1c81 cpl=3.
+
+The rest of the file already gets this right; i386_load_protected_mode_segment()
+reads descriptors with READ32PL(base + entry, 0). The fix makes the two task
+switch routines do the same.
+
+
+2. Only ring 0 may return to virtual 8086 mode
+---------------------------------------------------------------------------
+
+i386_protected_mode_iret() decides to return to virtual 8086 mode from the VM
+bit of the stacked EFLAGS alone. The manual takes that path only when CPL is
+also 0; at any outer level the bit is ignored and an ordinary protected mode
+return is performed. As it stood, a user mode IRET could put the processor into
+virtual 8086 mode by itself, tearing another 24 bytes off its own stack on the
+way. The same omission let an outer ring load the VM bit through the two
+ordinary return paths, so those now keep the old value.
+
+This one is real but it is not what broke the DOS window: with the nested task
+flag set the IRET never reaches that branch.
+
+
+3. The 386 is built without a coprocessor, and without its dispatch table
+---------------------------------------------------------------------------
+
+i386_device::device_start() calls
+
+    build_opcode_table(OP_I386);
+
+while every later model passes OP_FPU as well and then also calls
+build_x87_opcode_table(). So on the plain i386 the escape opcodes are not
+decoded at all: floating point does nothing and silently returns rubbish.
+
+On the guest it looks like this, and it took three wrong guesses to get here:
+
+    # echo hi | awk '{i=1; print "in rule i=[" i "]"}'
+    in rule i=[1.7762666567561593069e-307]
+    # echo hi | awk '{print 2+2}'
+    1.7763922789070136998e-307
+    # echo hi | awk '{i="abc"} END{print "i=[" i "]"}'
+    i=[abc]
+    # expr 2 + 2
+    4
+
+Strings are fine and the shell's own integer arithmetic is fine; everything
+that goes through a double is not, because awk keeps its numbers as doubles.
+It is what stopped the SunOS 4.0.2 upgrade: install_update works out whether
+the root and /usr file systems are local with an awk pipeline, and got an
+empty answer, so `expr` was handed a bare plus sign.
+
+Adding OP_FPU on its own segfaults MAME: the x87 dispatch table is still all
+nulls. Both calls are needed.
+
+
+4. The 386 never resets the x87
+---------------------------------------------------------------------------
+
+i386_device::device_reset() does not call x87_reset(); every model from the
+486 on does. The stack comes up tagged valid rather than empty, so the first
+fld overflows it. Software would normally not notice because the firmware
+runs FNINIT at power on, which brings us to the last one.
+
+
+5. The board has to say a 387 is fitted (not a MAME bug)
+---------------------------------------------------------------------------
+
+The SunOS kernel decides whether there is a coprocessor from one bit and
+nothing else, in initfp:
+
+    mov edx, cr0
+    test edx, 0x10          ; CR0.ET
+    jne mathchip_387
+    jmp nofp
+
+On a 386 that bit is set by the board when a 387 is present, and MAME's i386
+comes up with CR0 = 0x7fffffe0, so ET is clear. That is a fair default for a
+bare 386, but this machine has the chip, so the stub PROM now sets ET along
+with PE when it enters protected mode: `or al, 0x11` instead of `or al, 1`.
+Without it the kernel takes the nofp path and never initialises or saves the
+coprocessor, whatever MAME does.
+diff --git a/src/devices/cpu/i386/i386.cpp b/src/devices/cpu/i386/i386.cpp
+index 20b50c84..c48b9a19 100644
+--- a/src/devices/cpu/i386/i386.cpp
++++ b/src/devices/cpu/i386/i386.cpp
+@@ -2071,7 +2071,10 @@ void i386_device::device_start()
+ {
+ 	i386_common_init();
+ 
+-	build_opcode_table(OP_I386);
++	// a 387 is fitted: the escape opcodes have to be decoded and the x87
++	// dispatch table built, or the first one of them goes through a null
++	build_opcode_table(OP_I386 | OP_FPU);
++	build_x87_opcode_table();
+ 	m_cycle_table_rm = cycle_table_rm[CPU_CYCLES_I386].get();
+ 	m_cycle_table_pm = cycle_table_pm[CPU_CYCLES_I386].get();
+ 
+@@ -2553,6 +2556,8 @@ void i386_device::device_reset()
+ 
+ 	m_auto_clear_RF = true;
+ 
++	x87_reset();
++
+ 	CHANGE_PC(m_eip);
+ }
+ 
+diff --git a/src/devices/cpu/i386/i386segs.hxx b/src/devices/cpu/i386/i386segs.hxx
+index e2445d5d..a8b752c7 100644
+--- a/src/devices/cpu/i386/i386segs.hxx
++++ b/src/devices/cpu/i386/i386segs.hxx
+@@ -828,32 +828,32 @@ void i386_device::i286_task_switch(uint16_t selector, uint8_t nested)
+ 	{
+ 		if(m_task.segment & 0x0004)
+ 		{
+-			ar_byte = READ8(m_ldtr.base + (m_task.segment & ~0x0007) + 5);
+-			WRITE8(m_ldtr.base + (m_task.segment & ~0x0007) + 5,ar_byte & ~0x02);
++			ar_byte = READ8PL(m_ldtr.base + (m_task.segment & ~0x0007) + 5, 0);
++			WRITE8PL(m_ldtr.base + (m_task.segment & ~0x0007) + 5, 0, ar_byte & ~0x02);
+ 		}
+ 		else
+ 		{
+-			ar_byte = READ8(m_gdtr.base + (m_task.segment & ~0x0007) + 5);
+-			WRITE8(m_gdtr.base + (m_task.segment & ~0x0007) + 5,ar_byte & ~0x02);
++			ar_byte = READ8PL(m_gdtr.base + (m_task.segment & ~0x0007) + 5, 0);
++			WRITE8PL(m_gdtr.base + (m_task.segment & ~0x0007) + 5, 0, ar_byte & ~0x02);
+ 		}
+ 	}
+ 
+ 	/* Save the state of the current task in the current TSS (TR register base) */
+ 	tss = m_task.base;
+-	WRITE16(tss+0x0e,m_eip & 0x0000ffff);
+-	WRITE16(tss+0x10,get_flags() & 0x0000ffff);
+-	WRITE16(tss+0x12,REG16(AX));
+-	WRITE16(tss+0x14,REG16(CX));
+-	WRITE16(tss+0x16,REG16(DX));
+-	WRITE16(tss+0x18,REG16(BX));
+-	WRITE16(tss+0x1a,REG16(SP));
+-	WRITE16(tss+0x1c,REG16(BP));
+-	WRITE16(tss+0x1e,REG16(SI));
+-	WRITE16(tss+0x20,REG16(DI));
+-	WRITE16(tss+0x22,m_sreg[ES].selector);
+-	WRITE16(tss+0x24,m_sreg[CS].selector);
+-	WRITE16(tss+0x26,m_sreg[SS].selector);
+-	WRITE16(tss+0x28,m_sreg[DS].selector);
++	WRITE16PL(tss+0x0e, 0, m_eip & 0x0000ffff);
++	WRITE16PL(tss+0x10, 0, get_flags() & 0x0000ffff);
++	WRITE16PL(tss+0x12, 0, REG16(AX));
++	WRITE16PL(tss+0x14, 0, REG16(CX));
++	WRITE16PL(tss+0x16, 0, REG16(DX));
++	WRITE16PL(tss+0x18, 0, REG16(BX));
++	WRITE16PL(tss+0x1a, 0, REG16(SP));
++	WRITE16PL(tss+0x1c, 0, REG16(BP));
++	WRITE16PL(tss+0x1e, 0, REG16(SI));
++	WRITE16PL(tss+0x20, 0, REG16(DI));
++	WRITE16PL(tss+0x22, 0, m_sreg[ES].selector);
++	WRITE16PL(tss+0x24, 0, m_sreg[CS].selector);
++	WRITE16PL(tss+0x26, 0, m_sreg[SS].selector);
++	WRITE16PL(tss+0x28, 0, m_sreg[DS].selector);
+ 
+ 	old_task = m_task.segment;
+ 
+@@ -871,48 +871,48 @@ void i386_device::i286_task_switch(uint16_t selector, uint8_t nested)
+ 
+ 	/* Load incoming task state from the new task's TSS */
+ 	tss = m_task.base;
+-	m_ldtr.segment = READ16(tss+0x2a) & 0xffff;
++	m_ldtr.segment = READ16PL(tss+0x2a, 0) & 0xffff;
+ 	seg.selector = m_ldtr.segment;
+ 	i386_load_protected_mode_segment(&seg,nullptr);
+ 	m_ldtr.limit = seg.limit;
+ 	m_ldtr.base = seg.base;
+ 	m_ldtr.flags = seg.flags;
+-	m_eip = READ16(tss+0x0e);
+-	set_flags(READ16(tss+0x10));
+-	REG16(AX) = READ16(tss+0x12);
+-	REG16(CX) = READ16(tss+0x14);
+-	REG16(DX) = READ16(tss+0x16);
+-	REG16(BX) = READ16(tss+0x18);
+-	REG16(SP) = READ16(tss+0x1a);
+-	REG16(BP) = READ16(tss+0x1c);
+-	REG16(SI) = READ16(tss+0x1e);
+-	REG16(DI) = READ16(tss+0x20);
+-	m_sreg[ES].selector = READ16(tss+0x22) & 0xffff;
++	m_eip = READ16PL(tss+0x0e, 0);
++	set_flags(READ16PL(tss+0x10, 0));
++	REG16(AX) = READ16PL(tss+0x12, 0);
++	REG16(CX) = READ16PL(tss+0x14, 0);
++	REG16(DX) = READ16PL(tss+0x16, 0);
++	REG16(BX) = READ16PL(tss+0x18, 0);
++	REG16(SP) = READ16PL(tss+0x1a, 0);
++	REG16(BP) = READ16PL(tss+0x1c, 0);
++	REG16(SI) = READ16PL(tss+0x1e, 0);
++	REG16(DI) = READ16PL(tss+0x20, 0);
++	m_sreg[ES].selector = READ16PL(tss+0x22, 0) & 0xffff;
+ 	i386_load_segment_descriptor(ES);
+-	m_sreg[CS].selector = READ16(tss+0x24) & 0xffff;
++	m_sreg[CS].selector = READ16PL(tss+0x24, 0) & 0xffff;
+ 	i386_load_segment_descriptor(CS);
+-	m_sreg[SS].selector = READ16(tss+0x26) & 0xffff;
++	m_sreg[SS].selector = READ16PL(tss+0x26, 0) & 0xffff;
+ 	i386_load_segment_descriptor(SS);
+-	m_sreg[DS].selector = READ16(tss+0x28) & 0xffff;
++	m_sreg[DS].selector = READ16PL(tss+0x28, 0) & 0xffff;
+ 	i386_load_segment_descriptor(DS);
+ 
+ 	/* Set the busy bit in the new task's descriptor */
+ 	if(selector & 0x0004)
+ 	{
+-		ar_byte = READ8(m_ldtr.base + (selector & ~0x0007) + 5);
+-		WRITE8(m_ldtr.base + (selector & ~0x0007) + 5,ar_byte | 0x02);
++		ar_byte = READ8PL(m_ldtr.base + (selector & ~0x0007) + 5, 0);
++		WRITE8PL(m_ldtr.base + (selector & ~0x0007) + 5, 0, ar_byte | 0x02);
+ 	}
+ 	else
+ 	{
+-		ar_byte = READ8(m_gdtr.base + (selector & ~0x0007) + 5);
+-		WRITE8(m_gdtr.base + (selector & ~0x0007) + 5,ar_byte | 0x02);
++		ar_byte = READ8PL(m_gdtr.base + (selector & ~0x0007) + 5, 0);
++		WRITE8PL(m_gdtr.base + (selector & ~0x0007) + 5, 0, ar_byte | 0x02);
+ 	}
+ 
+ 	/* For nested tasks, we write the outgoing task's selector to the back-link field of the new TSS,
+ 	   and set the NT flag in the EFLAGS register */
+ 	if(nested != 0)
+ 	{
+-		WRITE16(tss+0,old_task);
++		WRITE16PL(tss+0, 0, old_task);
+ 		m_NT = 1;
+ 	}
+ 	CHANGE_PC(m_eip);
+@@ -938,35 +938,35 @@ void i386_device::i386_task_switch(uint16_t selector, uint8_t nested)
+ 	{
+ 		if(m_task.segment & 0x0004)
+ 		{
+-			ar_byte = READ8(m_ldtr.base + (m_task.segment & ~0x0007) + 5);
+-			WRITE8(m_ldtr.base + (m_task.segment & ~0x0007) + 5,ar_byte & ~0x02);
++			ar_byte = READ8PL(m_ldtr.base + (m_task.segment & ~0x0007) + 5, 0);
++			WRITE8PL(m_ldtr.base + (m_task.segment & ~0x0007) + 5, 0, ar_byte & ~0x02);
+ 		}
+ 		else
+ 		{
+-			ar_byte = READ8(m_gdtr.base + (m_task.segment & ~0x0007) + 5);
+-			WRITE8(m_gdtr.base + (m_task.segment & ~0x0007) + 5,ar_byte & ~0x02);
++			ar_byte = READ8PL(m_gdtr.base + (m_task.segment & ~0x0007) + 5, 0);
++			WRITE8PL(m_gdtr.base + (m_task.segment & ~0x0007) + 5, 0, ar_byte & ~0x02);
+ 		}
+ 	}
+ 
+ 	/* Save the state of the current task in the current TSS (TR register base) */
+ 	tss = m_task.base;
+-	WRITE32(tss+0x1c,m_cr[3]);  // correct?
+-	WRITE32(tss+0x20,m_eip);
+-	WRITE32(tss+0x24,get_flags());
+-	WRITE32(tss+0x28,REG32(EAX));
+-	WRITE32(tss+0x2c,REG32(ECX));
+-	WRITE32(tss+0x30,REG32(EDX));
+-	WRITE32(tss+0x34,REG32(EBX));
+-	WRITE32(tss+0x38,REG32(ESP));
+-	WRITE32(tss+0x3c,REG32(EBP));
+-	WRITE32(tss+0x40,REG32(ESI));
+-	WRITE32(tss+0x44,REG32(EDI));
+-	WRITE32(tss+0x48,m_sreg[ES].selector);
+-	WRITE32(tss+0x4c,m_sreg[CS].selector);
+-	WRITE32(tss+0x50,m_sreg[SS].selector);
+-	WRITE32(tss+0x54,m_sreg[DS].selector);
+-	WRITE32(tss+0x58,m_sreg[FS].selector);
+-	WRITE32(tss+0x5c,m_sreg[GS].selector);
++	WRITE32PL(tss+0x1c, 0, m_cr[3]);  // correct?
++	WRITE32PL(tss+0x20, 0, m_eip);
++	WRITE32PL(tss+0x24, 0, get_flags());
++	WRITE32PL(tss+0x28, 0, REG32(EAX));
++	WRITE32PL(tss+0x2c, 0, REG32(ECX));
++	WRITE32PL(tss+0x30, 0, REG32(EDX));
++	WRITE32PL(tss+0x34, 0, REG32(EBX));
++	WRITE32PL(tss+0x38, 0, REG32(ESP));
++	WRITE32PL(tss+0x3c, 0, REG32(EBP));
++	WRITE32PL(tss+0x40, 0, REG32(ESI));
++	WRITE32PL(tss+0x44, 0, REG32(EDI));
++	WRITE32PL(tss+0x48, 0, m_sreg[ES].selector);
++	WRITE32PL(tss+0x4c, 0, m_sreg[CS].selector);
++	WRITE32PL(tss+0x50, 0, m_sreg[SS].selector);
++	WRITE32PL(tss+0x54, 0, m_sreg[DS].selector);
++	WRITE32PL(tss+0x58, 0, m_sreg[FS].selector);
++	WRITE32PL(tss+0x5c, 0, m_sreg[GS].selector);
+ 
+ 	old_task = m_task.segment;
+ 
+@@ -984,61 +984,61 @@ void i386_device::i386_task_switch(uint16_t selector, uint8_t nested)
+ 
+ 	/* Load incoming task state from the new task's TSS */
+ 	tss = m_task.base;
+-	m_ldtr.segment = READ32(tss+0x60) & 0xffff;
++	m_ldtr.segment = READ32PL(tss+0x60, 0) & 0xffff;
+ 	seg.selector = m_ldtr.segment;
+ 	i386_load_protected_mode_segment(&seg,nullptr);
+ 	m_ldtr.limit = seg.limit;
+ 	m_ldtr.base = seg.base;
+ 	m_ldtr.flags = seg.flags;
+-	m_eip = READ32(tss+0x20);
+-	set_flags(READ32(tss+0x24));
+-	REG32(EAX) = READ32(tss+0x28);
+-	REG32(ECX) = READ32(tss+0x2c);
+-	REG32(EDX) = READ32(tss+0x30);
+-	REG32(EBX) = READ32(tss+0x34);
+-	REG32(ESP) = READ32(tss+0x38);
+-	REG32(EBP) = READ32(tss+0x3c);
+-	REG32(ESI) = READ32(tss+0x40);
+-	REG32(EDI) = READ32(tss+0x44);
+-	m_sreg[ES].selector = READ32(tss+0x48) & 0xffff;
++	m_eip = READ32PL(tss+0x20, 0);
++	set_flags(READ32PL(tss+0x24, 0));
++	REG32(EAX) = READ32PL(tss+0x28, 0);
++	REG32(ECX) = READ32PL(tss+0x2c, 0);
++	REG32(EDX) = READ32PL(tss+0x30, 0);
++	REG32(EBX) = READ32PL(tss+0x34, 0);
++	REG32(ESP) = READ32PL(tss+0x38, 0);
++	REG32(EBP) = READ32PL(tss+0x3c, 0);
++	REG32(ESI) = READ32PL(tss+0x40, 0);
++	REG32(EDI) = READ32PL(tss+0x44, 0);
++	m_sreg[ES].selector = READ32PL(tss+0x48, 0) & 0xffff;
+ 	i386_load_segment_descriptor(ES);
+-	m_sreg[CS].selector = READ32(tss+0x4c) & 0xffff;
++	m_sreg[CS].selector = READ32PL(tss+0x4c, 0) & 0xffff;
+ 	i386_load_segment_descriptor(CS);
+-	m_sreg[SS].selector = READ32(tss+0x50) & 0xffff;
++	m_sreg[SS].selector = READ32PL(tss+0x50, 0) & 0xffff;
+ 	i386_load_segment_descriptor(SS);
+-	m_sreg[DS].selector = READ32(tss+0x54) & 0xffff;
++	m_sreg[DS].selector = READ32PL(tss+0x54, 0) & 0xffff;
+ 	i386_load_segment_descriptor(DS);
+-	m_sreg[FS].selector = READ32(tss+0x58) & 0xffff;
++	m_sreg[FS].selector = READ32PL(tss+0x58, 0) & 0xffff;
+ 	i386_load_segment_descriptor(FS);
+-	m_sreg[GS].selector = READ32(tss+0x5c) & 0xffff;
++	m_sreg[GS].selector = READ32PL(tss+0x5c, 0) & 0xffff;
+ 	i386_load_segment_descriptor(GS);
+ 	/* For nested tasks, we write the outgoing task's selector to the back-link field of the new TSS,
+ 	   and set the NT flag in the EFLAGS register before setting cr3 as the old tss address might be gone */
+ 	if(nested != 0)
+ 	{
+-		WRITE32(tss+0,old_task);
++		WRITE32PL(tss+0, 0, old_task);
+ 		m_NT = 1;
+ 	}
+-	m_cr[3] = READ32(tss+0x1c);  // CR3 (PDBR)
++	m_cr[3] = READ32PL(tss+0x1c, 0);  // CR3 (PDBR)
+ 	if(oldcr3 != m_cr[3])
+ 		vtlb_flush_dynamic();
+ 
+ 	/* Set the busy bit in the new task's descriptor */
+ 	if(selector & 0x0004)
+ 	{
+-		ar_byte = READ8(m_ldtr.base + (selector & ~0x0007) + 5);
+-		WRITE8(m_ldtr.base + (selector & ~0x0007) + 5,ar_byte | 0x02);
++		ar_byte = READ8PL(m_ldtr.base + (selector & ~0x0007) + 5, 0);
++		WRITE8PL(m_ldtr.base + (selector & ~0x0007) + 5, 0, ar_byte | 0x02);
+ 	}
+ 	else
+ 	{
+-		ar_byte = READ8(m_gdtr.base + (selector & ~0x0007) + 5);
+-		WRITE8(m_gdtr.base + (selector & ~0x0007) + 5,ar_byte | 0x02);
++		ar_byte = READ8PL(m_gdtr.base + (selector & ~0x0007) + 5, 0);
++		WRITE8PL(m_gdtr.base + (selector & ~0x0007) + 5, 0, ar_byte | 0x02);
+ 	}
+ 
+ 	CHANGE_PC(m_eip);
+ 
+ 
+-	int t_bit = READ32(tss+0x64) & 1;
++	int t_bit = READ32PL(tss+0x64, 0) & 1;
+ 	if(t_bit) m_dr[6] |= (1 << 15); //If the T bit of the new TSS is set, set the BT bit of DR6.
+ 	m_CPL = (m_sreg[SS].flags >> 5) & 3;
+ 
+@@ -2135,7 +2135,7 @@ void i386_device::i386_protected_mode_iret(int operand32)
+ 	}
+ 	else
+ 	{
+-		if(newflags & 0x00020000) // if returning to virtual 8086 mode
++		if((newflags & 0x00020000) && CPL == 0) // only ring 0 returns to virtual 8086 mode
+ 		{
+ 			// 16-bit iret can't reach here
+ 			newESP = READ32(ea+12);
+@@ -2279,6 +2279,7 @@ void i386_device::i386_protected_mode_iret(int operand32)
+ 					newflags = (newflags & ~0x00003000) | (oldflags & 0x00003000);
+ 					if(CPL > IOPL)
+ 						newflags = (newflags & ~0x200 ) | (oldflags & 0x200);
++					newflags = (newflags & ~0x00020000) | (oldflags & 0x00020000);
+ 				}
+ 
+ 				if(operand32 == 0)
+@@ -2450,6 +2451,7 @@ void i386_device::i386_protected_mode_iret(int operand32)
+ 					newflags = (newflags & ~0x00003000) | (oldflags & 0x00003000);
+ 					if(CPL > IOPL)
+ 						newflags = (newflags & ~0x200 ) | (oldflags & 0x200);
++					newflags = (newflags & ~0x00020000) | (oldflags & 0x00020000);
+ 				}
+ 
+ 				if(operand32 == 0)

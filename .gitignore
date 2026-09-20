@@ -1,0 +1,9 @@
+# Nothing here redistributes Sun software or disk images.
+*.chd
+*.img
+*.raw
+media/
+nvram/
+snap/
+*.log
+__pycache__/
