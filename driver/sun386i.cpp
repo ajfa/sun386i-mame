@@ -1080,4 +1080,7 @@ ROM_END
 
 
 //    YEAR  NAME     PARENT COMPAT MACHINE  INPUT    CLASS          INIT        COMPANY             FULLNAME    FLAGS
-COMP( 1988, sun386i, 0,     0,     sun386i, sun386i, sun386i_state, empty_init, "Sun Microsystems", "Sun 386i", MACHINE_NOT_WORKING | MACHINE_NO_SOUND )
+// Boots SunOS 4.0.1 and 4.0.2 from disk to a colour SunView desktop, with
+// keyboard, mouse, both frame buffers, SCSI, diskette, the serial lines and
+// DOS windows. Not emulated: the 82586 network interface, the Weitek socket.
+COMP( 1988, sun386i, 0,     0,     sun386i, sun386i, sun386i_state, empty_init, "Sun Microsystems", "Sun 386i", MACHINE_NO_SOUND )

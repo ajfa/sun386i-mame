@@ -63,17 +63,25 @@ def setup():
 
 def start(disk, kernel):
     env = dict(os.environ)
-    # no window, no sound, and no display for the OSD to find: -video none on
-    # its own still brings up a window through SDL
-    for v in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"):
-        env.pop(v, None)
-    env["SDL_VIDEODRIVER"] = "dummy"
     env["SDL_AUDIODRIVER"] = "dummy"
     env.setdefault("SUN386I_SNAP", "25")
     env.setdefault("SUN386I_SHOTS", "60")
-    cmd = ["./sun386i", "sun386i", "-video", "none", "-sound", "none",
+
+    window = os.environ.get("SUN386I_WINDOW") and os.environ.get("DISPLAY")
+    if window:
+        # a window to watch it in, never full screen
+        video = ["-window", "-nomaximize"]
+    else:
+        # no window at all: -video none on its own still brings one up through
+        # SDL, so the display has to go out of the environment as well
+        for v in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_SESSION_TYPE"):
+            env.pop(v, None)
+        env["SDL_VIDEODRIVER"] = "dummy"
+        video = ["-video", "none"]
+
+    cmd = ["./sun386i", "sun386i"] + video + ["-sound", "none",
            "-quickload", kernel, "-hard", disk,
-           "-ttya", "pty", "-nothrottle", "-log"]
+           "-ttya", "pty", "-nothrottle", "-log", "-skip_gameinfo"]
     lua = os.environ.get("SUN386I_LUA")
     if lua:
         cmd += ["-autoboot_script", os.path.abspath(lua), "-autoboot_delay", "0"]
@@ -161,13 +169,33 @@ def main():
             return 1
         time.sleep(1.0)
         line.type(USER)
-        if line.wait(PROMPT, 0, 300) < 0:
+        # a .login that runs tset on an unknown terminal stops to ask for the
+        # terminal type, and nobody is there to press Return
+        at, asked, end = -1, False, time.time() + 300
+        while time.time() < end:
+            at = line.text.find(PROMPT)
+            if at >= 0:
+                break
+            if not asked and "TERM = (" in line.text:
+                asked = True
+                time.sleep(1.0)
+                line.type("", parity=True)
+            line.pump(1.0)
+        if at < 0:
             print("FAIL: could not log in", flush=True)
             print(line.text[-600:], flush=True)
             return 1
         print("logged in as %s" % USER, flush=True)
 
         for cmd in commands:
+            # a marker rather than a command: tell whatever is driving the
+            # screen that the machine is up, so it does not have to guess at
+            # how long this host takes to boot
+            if cmd == "@ready":
+                with open(os.path.join(RUN, "ready"), "w") as f:
+                    f.write("go\n")
+                print("ok: the screen side can go ahead now", flush=True)
+                continue
             mark = len(line.text)
             time.sleep(1.0)
             line.type(cmd, parity=True)
