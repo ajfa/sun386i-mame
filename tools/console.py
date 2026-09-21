@@ -79,6 +79,8 @@ def start(disk, kernel):
         env["SDL_VIDEODRIVER"] = "dummy"
         video = ["-video", "none"]
 
+    # only the colour screen: the mono one stays blank all the way
+    video += ["-view", "Screen 1 Pixel Aspect"]
     cmd = ["./sun386i", "sun386i"] + video + ["-sound", "none",
            "-quickload", kernel, "-hard", disk,
            "-ttya", "pty", "-nothrottle", "-log", "-skip_gameinfo"]
