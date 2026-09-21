@@ -36,8 +36,16 @@ RUN = os.environ.get("SUN386I_RUN", "run")
 MAME = os.environ.get("SUN386I_MAME", "./sun386i")
 USER = os.environ.get("SUN386I_USER", "root")
 PROMPT = os.environ.get("SUN386I_PROMPT", "SUPERUSER")
-BOOT_TIMEOUT = int(os.environ.get("SUN386I_BOOT_TIMEOUT", "900"))
-STEP_TIMEOUT = int(os.environ.get("SUN386I_STEP_TIMEOUT", "600"))
+# These are wall clock seconds, and the machine they are waiting for runs at
+# whatever speed the host manages: measured here, between 380 per cent with no
+# window and under 30 inside a virtual machine. So they are set for the slow
+# case, because giving up early on a slow host looks exactly like a hang.
+BOOT_TIMEOUT = int(os.environ.get("SUN386I_BOOT_TIMEOUT", "2400"))
+# 3600 because one of the steps is a long sleep counted in the machine's
+# own seconds: 800 of those are 1140 seconds of wall clock at 70 per cent
+# and nearly an hour inside a slow virtual machine
+STEP_TIMEOUT = int(os.environ.get("SUN386I_STEP_TIMEOUT", "3600"))
+LOGIN_TIMEOUT = int(os.environ.get("SUN386I_LOGIN_TIMEOUT", "900"))
 
 
 def need(name):
@@ -110,13 +118,21 @@ class Line:
         self.out.flush()
         return True
 
-    def wait(self, needle, start, timeout):
-        end = time.time() + timeout
+    def wait(self, needle, start, timeout, what=None):
+        began = time.time()
+        end = began + timeout
+        beat = began
         while time.time() < end:
             at = self.text.find(needle, start)
             if at >= 0:
                 return at
             self.pump(1.0)
+            # say something every half minute: on a slow host this can take
+            # a quarter of an hour, and silence reads as a hang
+            if what and time.time() - beat >= 30:
+                beat = time.time()
+                print("  esperando %s, van %d s de %d"
+                      % (what, time.time() - began, timeout), flush=True)
         return -1
 
     def type(self, s, parity=False):
@@ -166,14 +182,15 @@ def main():
         termios.tcsetattr(fd, termios.TCSANOW, a)
         line = Line(fd, os.path.join(RUN, "console.log"))
 
-        if line.wait("login:", 0, BOOT_TIMEOUT) < 0:
+        if line.wait("login:", 0, BOOT_TIMEOUT, "que arranque la maquina") < 0:
             print("FAIL: no login prompt", flush=True)
             return 1
         time.sleep(1.0)
         line.type(USER)
         # a .login that runs tset on an unknown terminal stops to ask for the
         # terminal type, and nobody is there to press Return
-        at, asked, end = -1, False, time.time() + 300
+        at, asked, end = -1, False, time.time() + LOGIN_TIMEOUT
+        beat = time.time()
         while time.time() < end:
             at = line.text.find(PROMPT)
             if at >= 0:
@@ -183,6 +200,9 @@ def main():
                 time.sleep(1.0)
                 line.type("", parity=True)
             line.pump(1.0)
+            if time.time() - beat >= 30:
+                beat = time.time()
+                print("  entrando como %s..." % USER, flush=True)
         if at < 0:
             print("FAIL: could not log in", flush=True)
             print(line.text[-600:], flush=True)
@@ -196,12 +216,19 @@ def main():
             if cmd == "@ready":
                 with open(os.path.join(RUN, "ready"), "w") as f:
                     f.write("go\n")
+                wait = os.environ.get("SUN386I_AFTER_READY", "60")
                 print("ok: the screen side can go ahead now", flush=True)
+                # the screen side counts in the machine's own seconds, so on a
+                # slow host this is several minutes of watching a still screen
+                print("    it types the username %s machine seconds from now."
+                      % wait, flush=True)
+                print("    on a slow host that is minutes of wall clock with"
+                      " nothing moving. That is normal.", flush=True)
                 continue
             mark = len(line.text)
             time.sleep(1.0)
             line.type(cmd, parity=True)
-            if line.wait(PROMPT, mark + len(cmd), STEP_TIMEOUT) < 0:
+            if line.wait(PROMPT, mark + len(cmd), STEP_TIMEOUT, cmd[:40]) < 0:
                 print("FAIL: %r gave no prompt back" % cmd, flush=True)
                 print(line.text[-600:], flush=True)
                 return 1
